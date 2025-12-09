@@ -390,10 +390,7 @@ def main():
             ["KNOWN_BENIGN", "KNOWN_MALICIOUS", "UNKNOWN_MALICIOUS"],
         )
 
-        error_only = st.sidebar.checkbox(
-            "Sample only misclassified flows (model open-set ≠ ground truth)",
-            value=False,
-        )
+        error_only = False
 
         if st.sidebar.button("Sample and analyze"):
             row, df_name = sample_row_for_random(
