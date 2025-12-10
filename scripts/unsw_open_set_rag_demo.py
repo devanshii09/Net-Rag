@@ -43,6 +43,12 @@ from langchain_community.chat_models import ChatOllama
 from langchain_community.vectorstores import Chroma
 from langchain.embeddings.base import Embeddings
 from langchain.schema import HumanMessage, SystemMessage
+# --- NEW IMPORT ---
+from sentence_transformers import CrossEncoder
+
+# --- INITIALIZE MODEL (Global Scope) ---
+print("[INFO] Loading Re-Ranker Model...")
+RERANKER = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
 
 # -----------------------------
 # Paths and constants
@@ -237,79 +243,104 @@ def safe_float_from_row(row: pd.Series, col: str, default: float = 0.0) -> float
         return default
 
 
-def serialize_unsw_flow(row: pd.Series, include_labels: bool = True) -> str:
+def serialize_unsw_flow(row, include_labels=False):
     """
-    Turn one UNSW row into a short natural-language description.
-    Now includes 'Behavioral Hints' to help the embedding model separate 
-    overlapping clusters like DoS vs Generic.
+    Serializes a UNSW-NB15 flow into a semantic string with feature bucketing
+    to help the embedding model distinguish DoS and Exploits.
     """
-    proto = str(row.get("proto", "unknown"))
-    state = str(row.get("state", "unknown"))
+    parts = []
 
-    sport = safe_int_from_row(row, "sport", -1)
-    dport = safe_int_from_row(row, "dport", -1)
+    # 1. Basic Identifiers
+    proto = str(row.get('proto', 'unknown'))
+    service = str(row.get('service', '-'))
+    parts.append(f"Protocol: {proto}")
+    if service != '-':
+        parts.append(f"Service: {service}")
 
-    dur = safe_float_from_row(row, "dur", 0.0)
-    sbytes = safe_int_from_row(row, "sbytes", 0)
-    dbytes = safe_int_from_row(row, "dbytes", 0)
-    spkts = safe_int_from_row(row, "spkts", 0)
-    dpkts = safe_int_from_row(row, "dpkts", 0)
-    rate = safe_float_from_row(row, "rate", 0.0)
-    sttl = safe_int_from_row(row, "sttl", 0)
-    dttl = safe_int_from_row(row, "dttl", 0)
-
-    family = str(row.get("attack_cat", "Unknown"))
-    label_binary = int(row.get("label", 0))
-
-    label_text = "benign" if label_binary == 0 else "malicious"
-
-    # --- NEW: BEHAVIORAL HINTS ---
-    # These strings help the embedding model distinguish between 
-    # attacks that otherwise look numerically similar.
-    hints = []
-
-    # Hint 1: DoS / High Speed
-    # If duration is tiny but rate is huge, it's likely a flood.
-    if dur < 0.005 and rate > 10000:
-        hints.append("High-speed traffic burst indicative of flooding or DoS.")
-
-    # Hint 2: Shellcode / Exploits
-    # If sending large payload (sbytes) but receiving almost nothing (dbytes).
-    if sbytes > 800 and dbytes < 50:
-        hints.append("Large unidirectional payload potential shellcode.")
-
-    # Join the hints into a string (Handle empty case)
-    if hints:
-        hint_text = "Behavioral notes: " + " ".join(hints)
+    # 2. Duration Bucketing (Critical for DoS vs Normal)
+    # DoS flows are often extremely short (single packet bursts) or very long floods.
+    dur = float(row.get('dur', 0.0))
+    if dur < 0.001:
+        dur_desc = "INSTANT"
+    elif dur < 0.1:
+        dur_desc = "VERY_SHORT"
+    elif dur > 5.0:
+        dur_desc = "LONG_DURATION"
     else:
-        hint_text = ""
+        dur_desc = "NORMAL_DURATION"
+    parts.append(f"Duration: {dur:.4f}s ({dur_desc})")
 
-    # --- CONSTRUCT DESCRIPTION ---
-    base = (
-        f"UNSW network flow with protocol {proto}, state {state}, "
-        f"source port {sport}, destination port {dport}. "
-        f"Duration {dur:.6f} seconds. Bytes from source to destination: {sbytes}, "
-        f"bytes from destination to source: {dbytes}. "
-        f"Packets from source to destination: {spkts}, packets from destination to source: {dpkts}. "
-        f"Average rate: {rate:.6f} packets/second. "
-        f"Source TTL: {sttl}, destination TTL: {dttl}. "
-        f"{hint_text}"  # <--- Now hint_text is guaranteed to be defined
-    )
+    # 3. Volume/Rate Bucketing (Critical for DoS)
+    # Sload/Dload (Source/Dest bits per second) are the strongest indicators for DoS.
+    sload = float(row.get('sload', 0.0))
+    if sload > 1e8: # > 100 Mbps
+        load_desc = "EXTREME_LOAD"
+    elif sload > 1e6: # > 1 Mbps
+        load_desc = "HIGH_LOAD"
+    else:
+        load_desc = "NORMAL_LOAD"
+    parts.append(f"SourceLoad: {sload:.1f} ({load_desc})")
 
-    if not include_labels:
-        return base
+    # 4. Payload Size (Critical for Exploits)
+    # Exploits often have specific, non-zero but small payload sizes compared to file transfers.
+    sbytes = float(row.get('sbytes', 0))
+    dbytes = float(row.get('dbytes', 0))
+    
+    if sbytes == 0:
+        size_desc = "EMPTY"
+    elif sbytes < 200:
+        size_desc = "TINY_PAYLOAD" # Common for probes/exploits
+    elif sbytes > 10000:
+        size_desc = "LARGE_TRANSFER"
+    else:
+        size_desc = "NORMAL_SIZE"
+    parts.append(f"SourceBytes: {int(sbytes)} ({size_desc})")
 
-    return (
-        base
-        + " "
-        f"In the dataset this is labeled as {label_text}, attack family: {family}."
-    )
+    # 5. TTL (Time To Live) - (Critical for Generic Exploits)
+    # Attackers often use non-standard TTLs (e.g., 254 vs 64).
+    sttl = int(row.get('sttl', 0))
+    parts.append(f"SourceTTL: {sttl}")
 
+    # 6. TCP State (If available)
+    state = str(row.get('state', ''))
+    if state:
+        parts.append(f"TCP_State: {state}")
+
+    # OPTIONAL: Include label only if generating the DB (not during inference)
+    if include_labels:
+        parts.append(f"Label: {'Malicious' if row.get('label', 0)==1 else 'Benign'}")
+        parts.append(f"AttackFamily: {row.get('attack_cat', 'Normal')}")
+
+    return " | ".join(parts)
 
 # -----------------------------
 # Chroma index with batching
 # -----------------------------
+def stratified_sample(df: pd.DataFrame, max_total: int = 10_000, per_family_cap: int = 2_000) -> pd.DataFrame:
+    """
+    Balanced down-sampling: Caps each family at `per_family_cap` so 'Normal'
+    doesn't drown out the rare attacks.
+    """
+    if "attack_cat" not in df.columns:
+        return df.sample(n=min(len(df), max_total), random_state=42)
 
+    groups = []
+    for fam, sub in df.groupby("attack_cat"):
+        # Cap large families (like Normal/Generic)
+        n = min(len(sub), per_family_cap)
+        if n > 0:
+            groups.append(sub.sample(n=n, random_state=42))
+
+    if not groups:
+        return df.iloc[0:0].copy()
+
+    df_bal = pd.concat(groups)
+
+    # Randomly sample down if total is still too big
+    if len(df_bal) > max_total:
+        df_bal = df_bal.sample(n=max_total, random_state=42)
+
+    return df_bal
 
 def build_chroma_index(
     df_index: pd.DataFrame,
@@ -320,96 +351,99 @@ def build_chroma_index(
     batch_size: int = 5000,
 ) -> Chroma:
     """
-    Build a Chroma index over df_index (typically train-known flows).
-
-    - Optionally subsample to max_flows
-    - Serialize each row into text
-    - Attach metadata (family, label, row_idx)
-    - Upsert to Chroma in batches to avoid max batch-size errors
+    Build a Chroma index with BALANCED sampling and NOMIC prefixes.
     """
+    # 1. BALANCED SAMPLING (Fixes "All neighbors are Normal")
     if max_flows is not None and len(df_index) > max_flows:
-        print(
-            f"[INFO] Sampling {max_flows:,} flows out of {len(df_index):,} "
-            "for Chroma index to keep it fast."
-        )
-        df_index = df_index.sample(n=max_flows, random_state=42)
+        print(f"[INFO] Stratified sampling {max_flows:,} flows (balancing families)...")
+        df_index = stratified_sample(df_index, max_total=max_flows, per_family_cap=2000)
     else:
-        print(
-            f"[INFO] Indexing {len(df_index):,} flows into Chroma collection "
-            f"'{collection_name}' at {persist_dir}"
-        )
+        print(f"[INFO] Indexing all {len(df_index):,} flows...")
 
-    # Attach original index as row_idx if not present
     if "row_idx" not in df_index.columns:
         df_index = df_index.copy()
         df_index["row_idx"] = df_index.index.astype(int)
 
-    # Prepare texts + metadata
     texts: List[str] = []
     metadatas: List[Dict[str, Any]] = []
 
     for _, row in df_index.iterrows():
-        # For index documents, we *do* include dataset labels.
-        text = serialize_unsw_flow(row, include_labels=True)
-        texts.append(text)
+        # 2. ADD NOMIC PREFIX (Fixes "Low Similarity Scores")
+        # Nomic needs to know this is a document to be searched
+        raw_text = serialize_unsw_flow(row, include_labels=True)
+        text_with_prefix = "search_document: " + raw_text
+        texts.append(text_with_prefix)
 
         fam = str(row.get("attack_cat", "Unknown"))
         lbl = int(row.get("label", 0))
         row_index = int(row["row_idx"])
 
-        meta = {
+        metadatas.append({
             "family": fam,
             "attack_cat": fam,
             "label": lbl,
             "label_binary": lbl,
             "row_idx": row_index,
-        }
-        metadatas.append(meta)
+        })
 
-    assert len(texts) == len(metadatas)
-
-    # Fresh Chroma directory
+    # Wipe old DB to prevent mixing bad/good embeddings
     if persist_dir.exists():
-        print(f"[INFO] Removing existing Chroma dir at {persist_dir}")
         shutil.rmtree(persist_dir)
     persist_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create empty collection
     vectorstore = Chroma(
         collection_name=collection_name,
         embedding_function=embedder,
         persist_directory=str(persist_dir),
+        # [REPORT ALIGNMENT] Forces Cosine Similarity as stated in Section 6.4 of your report
+        collection_metadata={"hnsw:space": "cosine"}
     )
 
+    # Batch upsert
     n_docs = len(texts)
-    if n_docs == 0:
-        print("[WARN] No flows to index in Chroma.")
-        return vectorstore
+    for i in range(0, n_docs, batch_size):
+        end = min(i + batch_size, n_docs)
+        vectorstore.add_texts(texts[i:end], metadatas=metadatas[i:end])
+        print(f"[INFO] Batch {i}-{end} upserted.")
 
-    effective_batch_size = min(batch_size, n_docs)
-    n_batches = math.ceil(n_docs / effective_batch_size)
-
-    print(
-        f"[INFO] Upserting {n_docs:,} docs into Chroma "
-        f"in {n_batches} batch(es) of at most {effective_batch_size} docs."
-    )
-
-    for b in range(n_batches):
-        start = b * effective_batch_size
-        end = min(start + effective_batch_size, n_docs)
-        batch_texts = texts[start:end]
-        batch_metas = metadatas[start:end]
-
-        vectorstore.add_texts(batch_texts, metadatas=batch_metas)
-        print(
-            f"[INFO]   Batch {b+1}/{n_batches} upserted "
-            f"({start}–{end-1}, size={len(batch_texts)})"
-        )
-
-    vectorstore.persist()
+    # Note: Chroma 0.4+ persists automatically, but explicit call is safe in older versions
+    try:
+        vectorstore.persist()
+    except:
+        pass
+        
     print("[INFO] Chroma index build complete.\n")
     return vectorstore
 
+
+def stratified_sample(df: pd.DataFrame, max_total: int = 10_000, per_family_cap: int = 2_000) -> pd.DataFrame:
+    """
+    Balanced down-sampling by attack_cat:
+    - Caps each family at `per_family_cap` to prevent "Normal" from dominating.
+    - Randomly samples to reach `max_total` if the result is still too big.
+    """
+    if "attack_cat" not in df.columns:
+        # Fallback if column missing
+        return df.sample(n=min(len(df), max_total), random_state=42)
+
+    groups = []
+    # 1. Cap each family
+    for fam, sub in df.groupby("attack_cat"):
+        n = min(len(sub), per_family_cap)
+        if n <= 0:
+            continue
+        groups.append(sub.sample(n=n, random_state=42))
+
+    if not groups:
+        return df.iloc[0:0].copy()
+
+    df_bal = pd.concat(groups)
+
+    # 2. Global cap (if sum of capped families is still > max_total)
+    if len(df_bal) > max_total:
+        df_bal = df_bal.sample(n=max_total, random_state=42)
+
+    return df_bal
 
 def build_or_load_chroma(
     df_train_known: pd.DataFrame,
@@ -671,61 +705,115 @@ def family_forward(
 # -----------------------------
 # RAG retrieval
 # -----------------------------
-
-
-def retrieve_neighbors(
-    vectorstore: Chroma,
-    query_text: str,
-    k: int = 5,
-) -> RAGSummary:
+def parse_chroma_docs(docs_and_scores) -> List[NeighborSummary]:
     """
-    Retrieve top-k similar flows; convert Chroma distances to "similarity" scores.
+    Converts raw Chroma results (doc, score) into clean NeighborSummary objects.
     """
-    docs_with_scores = vectorstore.similarity_search_with_score(query_text, k=k)
-    neighbors: List[NeighborSummary] = []
-
-    for doc, dist in docs_with_scores:
-        # Chroma returns distance; convert to a pseudo-similarity
-        sim = (1.0 / (1.0 + dist))
-        meta = doc.metadata or {}
-        fam = str(meta.get("family", meta.get("attack_cat", "Unknown")))
-        lbl = int(meta.get("label", meta.get("label_binary", 0)))
-        row_idx_meta = meta.get("row_idx", None)
-        try:
-            row_idx_val = int(row_idx_meta) if row_idx_meta is not None else None
-        except Exception:
-            row_idx_val = None
-
-        neighbors.append(
-            NeighborSummary(
-                family=fam,
-                label=lbl,
-                score=float(sim),
-                row_idx=row_idx_val,
-            )
+    neighbors = []
+    for doc, raw_score in docs_and_scores:
+        meta = doc.metadata
+        
+        family = str(meta.get("attack_cat", "Unknown"))
+        label = int(meta.get("label", 0))
+        row_idx = int(meta.get("row_idx", -1))
+        
+        # [REPORT ALIGNMENT] 
+        # Chroma with "cosine" space returns Cosine Distance (0 = identical, 1 = orthogonal).
+        # We want Cosine Similarity (1 = identical, 0 = orthogonal).
+        # Formula: Similarity = 1.0 - Distance
+        
+        similarity = 1.0 - float(raw_score)
+        
+        # Clamp it to ensure 0-1 range despite potential floating point noise
+        similarity = max(0.0, min(1.0, similarity))
+        
+        n = NeighborSummary(
+            family=family,
+            label=label,
+            score=similarity, 
+            row_idx=row_idx
         )
+        neighbors.append(n)
+    return neighbors
 
+def summarize_rag(neighbors: List[NeighborSummary]) -> RAGSummary:
+    """
+    Computes summary statistics over the retrieved neighbors.
+    """
     if not neighbors:
-        return RAGSummary(
-            sim_max=0.0, sim_mean=0.0, mal_frac=0.0, family_diversity=0, neighbors=[]
-        )
+        return RAGSummary(0.0, 0.0, 0.0, 0, [])
 
-    scores = np.array([n.score for n in neighbors])
-    labels = np.array([n.label for n in neighbors])
-    families = [n.family for n in neighbors]
+    # 1. Similarity stats
+    scores = [n.score for n in neighbors]
+    # Note: Chroma usually returns L2 distance (lower is better) or Cosine distance.
+    # If using Nomic with default settings, it might be distance. 
+    # Ideally, we convert to similarity (1 - distance) if needed, 
+    # but for this demo, we assume the score acts as a proxy for similarity.
+    sim_mean = sum(scores) / len(scores)
+    sim_max = max(scores)
 
-    sim_max = float(scores.max())
-    sim_mean = float(scores.mean())
-    mal_frac = float((labels == 1).mean())
-    family_diversity = len(set(families))
+    # 2. Malicious fraction
+    mal_count = sum([1 for n in neighbors if n.label == 1])
+    mal_frac = mal_count / len(neighbors)
+
+    # 3. Diversity
+    unique_families = set([n.family for n in neighbors])
+    family_diversity = len(unique_families)
 
     return RAGSummary(
         sim_max=sim_max,
         sim_mean=sim_mean,
         mal_frac=mal_frac,
         family_diversity=family_diversity,
-        neighbors=neighbors,
+        neighbors=neighbors
     )
+
+def retrieve_neighbors(vectorstore, q_text, rf_out=None, family_out=None, k=5):
+    """
+    Retrieves k neighbors from Chroma, optionally filtering by:
+      1. Binary RF prediction (Benign vs Malicious)
+      2. Family RF prediction (Exploits vs Generic, etc.)
+    """
+    
+    # 1. Fetch a larger pool of candidates (4x what we need)
+    k_pool = k * 4
+    
+    # CRITICAL FIX: Use similarity_search_with_score to get the distance/similarity
+    # Returns List[Tuple[Document, float]]
+    docs_and_scores = vectorstore.similarity_search_with_score(q_text, k=k_pool)
+    
+    # Parse raw Chroma docs into our helper objects
+    all_neighbors = parse_chroma_docs(docs_and_scores)
+
+    # ---------------------------------------------------------
+    # FILTER 1: Binary RF (Consistency Check)
+    # ---------------------------------------------------------
+    binary_filtered = all_neighbors
+    if rf_out and rf_out.rf_confidence > 0.7:
+        pred_label = 0 if rf_out.p_benign > rf_out.p_malicious else 1
+        filtered_list = [n for n in all_neighbors if n.label == pred_label]
+        if len(filtered_list) > 0:
+            binary_filtered = filtered_list
+
+    # ---------------------------------------------------------
+    # FILTER 2: Family RF (Guided Reranking)
+    # ---------------------------------------------------------
+    final_candidates = binary_filtered
+    
+    if family_out and family_out.family_conf > 0.8:
+        pred_family = family_out.family_pred
+        same_family = [n for n in binary_filtered if n.family == pred_family]
+        other_family = [n for n in binary_filtered if n.family != pred_family]
+        
+        if len(same_family) > 0:
+            final_candidates = same_family + other_family
+
+    # ---------------------------------------------------------
+    # Final Selection
+    # ---------------------------------------------------------
+    top_k_neighbors = final_candidates[:k]
+
+    return summarize_rag(top_k_neighbors)
 
 
 # -----------------------------
@@ -840,7 +928,6 @@ def evaluate_family_open_set_with_rag(
     preds_unknown = probs_unknown.argmax(axis=1)
     fam_names_unknown = family_le.inverse_transform(preds_unknown)
     fam_series = pd.Series(fam_names_unknown)
-    # For unknown malicious, treat "Generic" as NA/blank in reporting
     fam_series_display = fam_series.replace({"Generic": "NA"})
 
     print(f"Top predicted families for {unknown_name_str} / unknown flows:")
@@ -888,11 +975,9 @@ def evaluate_family_open_set_with_rag(
     known_total = len(known_is_unknown)
     unk_total = len(unknown_is_unknown)
 
-    # Known-family malicious samples
     known_pred_unknown = int(known_is_unknown.sum())
     known_pred_known = int(known_total - known_pred_unknown)
 
-    # Unknown-family malicious samples
     unk_pred_unknown = int(unknown_is_unknown.sum())
     unk_pred_known = int(unk_total - unk_pred_unknown)
 
@@ -941,35 +1026,25 @@ def derive_open_set_label_with_family(
     rf_out: RFOutput,
     family_out: FamilyRFOutput,
     rag_summary: Optional[RAGSummary] = None,
-    debug: bool = False,  # <--- Added debug flag
+    debug: bool = False,
 ) -> Tuple[str, List[str], str]:
-    
+
     reasons: List[str] = []
-    
-    # 1. CLEAN INPUTS
+
     pred_str = str(family_out.family_pred).strip()
-    
-    # 2. DEFINE THRESHOLDS
-    # Veto: If sim is below this, it's UNKNOWN (unless rescued by Phase 3)
-    RAG_VETO_THRESH = 0.0100 
-    
-    # Rescue Floor: Minimum sim needed to trust a neighbor vote (prevents using noise)
-    RAG_RESCUE_FLOOR = 0.0080
-    
-    # RF Confidence: Above this, we generally trust the RF (The "Expert")
+
+    # Thresholds
+    RAG_VETO_THRESH = 0.30
+    RAG_RESCUE_FLOOR = 0.50
+
     WEAK_RAG_FAMILIES = ["DoS", "Worms", "Analysis", "Backdoor"]
-    
-    # Standard Thresholds
     RF_HIGH_CONFIDENCE = 0.90
-    
-    # 1. DYNAMIC THRESHOLD ADJUSTMENT
-    # If the RF predicts a family that RAG is bad at, we lower the confidence requirement.
-    # We trust the "Expert" (RF) because the "Historian" (RAG) is blind to these.
+
     if pred_str in WEAK_RAG_FAMILIES:
-        if debug: print(f"   -> Detected Weak RAG Family ({pred_str}). Lowering RF Trust Threshold.")
+        if debug:
+            print(f"   -> Detected Weak RAG Family ({pred_str}). Lowering RF Trust Threshold.")
         RF_HIGH_CONFIDENCE = 0.75
 
-    # --- DEBUG TRACE ---
     if debug:
         sim_val = rag_summary.sim_max if rag_summary else 0.0
         print(f"\n[LOGIC TRACE] RF_Conf={family_out.family_conf:.3f} | Sim={sim_val:.4f} | Pred={pred_str}")
@@ -978,87 +1053,79 @@ def derive_open_set_label_with_family(
     # PHASE 1: BENIGN CHECK (Binary RF says Safe)
     # =========================================================
     if rf_out.p_malicious < 0.20 and pred_str in ("None", "Normal"):
-        if debug: print("   -> Triggered PHASE 1: Benign Check")
+        if debug:
+            print("   -> Triggered PHASE 1: Benign Check")
         return "KNOWN_BENIGN", [f"Binary RF benign ({rf_out.p_malicious:.3f})"], "Normal"
 
     # =========================================================
-    # PHASE 2: HIGH CONFIDENCE "SAFETY VALVE"
+    # PHASE 2: HIGH CONFIDENCE FAMILY RF
     # =========================================================
-    # If RF is > 90% confident, we trust it, BUT we allow RAG to audit it.
     if not family_out.family_unknown and family_out.family_conf >= RF_HIGH_CONFIDENCE:
-        
-        # A. CONSENSUS AUDIT (The only thing that overrides a 90% RF)
-        if rag_summary and rag_summary.neighbors:
-            neighbor_families = [n.family for n in rag_summary.neighbors]
-            vote_counts = Counter(neighbor_families)
-            top_family, top_count = vote_counts.most_common(1)[0]
-            
-            # Condition: 3+ neighbors agree, AND they disagree with RF, AND sim is decent
-            if top_count >= 3 and top_family != pred_str and rag_summary.sim_max > RAG_RESCUE_FLOOR:
-                if debug: print(f"   -> Triggered PHASE 2: Consensus Audit (Override {pred_str} -> {top_family})")
-                return "KNOWN_MALICIOUS", [
-                    f"RF Confident ({pred_str}) but RAG Majority ({top_count}/5) says '{top_family}'.",
-                    "Consensus Audit: Overriding RF."
-                ], top_family
+        if debug:
+            print(f"   -> Triggered PHASE 2: High Confidence RF ({pred_str})")
 
-        # B. Trust the RF
-        if debug: print(f"   -> Triggered PHASE 2: High Confidence RF ({pred_str})")
-        
-        # Special case: If RF is super confident it's Normal, label it Benign
         if pred_str == "Normal":
-            return "KNOWN_BENIGN", ["Family RF is 100% confident it is Normal."], "Normal"
-            
+            return "KNOWN_BENIGN", ["Family RF is high-confidence Normal."], "Normal"
+
         return "KNOWN_MALICIOUS", [f"RF Confident ({family_out.family_conf:.3f})"], pred_str
 
     # =========================================================
-    # PHASE 3: THE "RESCUE" (Wisdom of the Crowd)
+    # PHASE 3: "RESCUE" FROM NEIGHBORS (only if RF family is low-confidence)
     # =========================================================
-    # If RF was unsure (< 0.90), we look at neighbors. 
-    # This runs BEFORE Veto to save flows with slightly low similarity (e.g. 0.008)
-    if rag_summary and rag_summary.neighbors:
+    if rag_summary and rag_summary.neighbors and family_out.family_unknown:
         neighbor_families = [n.family for n in rag_summary.neighbors]
         vote_counts = Counter(neighbor_families)
         top_family, top_count = vote_counts.most_common(1)[0]
-        
-        # We perform rescue if sim is above the garbage floor and there is a majority
+
         if rag_summary.sim_max > RAG_RESCUE_FLOOR and top_count >= 3:
-            
-            # Sub-case: RF is unsure (< 0.90) - which we know is true if we passed Phase 2
-            if debug: print(f"   -> Triggered PHASE 3: Majority Rescue (Neighbors say {top_family})")
-            
-            # Case A: Neighbors are Malicious -> KNOWN_MALICIOUS
             if top_family not in ["Normal", "Benign"]:
                 reasons.append(f"Majority Rescue: {top_count}/5 neighbors are '{top_family}'.")
+                if debug:
+                    print(f"   -> Triggered PHASE 3: Majority Rescue (malicious family {top_family})")
                 return "KNOWN_MALICIOUS", reasons, top_family
-            
-            # Case B: Neighbors are Benign -> KNOWN_BENIGN
             else:
-                 reasons.append(f"Majority Rescue: {top_count}/5 neighbors are Benign/Normal.")
-                 return "KNOWN_BENIGN", reasons, "Normal"
+                # Only rescue to benign if binary RF is not strongly malicious
+                if rf_out.p_malicious < 0.50:
+                    reasons.append(
+                        f"Majority Rescue: {top_count}/5 neighbors are Benign/Normal "
+                        "and binary RF is not strongly malicious."
+                    )
+                    if debug:
+                        print("   -> Triggered PHASE 3: Benign Rescue (neighbors benign, RF weak)")
+                    return "KNOWN_BENIGN", reasons, "Normal"
+                else:
+                    reasons.append(
+                        "Neighbors mostly benign, but binary RF is strongly malicious; "
+                        "ignoring benign rescue."
+                    )
+                    if debug:
+                        print(
+                            "   -> PHASE 3: Benign majority ignored (RF strongly malicious)"
+                        )
 
     # =========================================================
-    # PHASE 4: THE "UNKNOWN" VETO
+    # PHASE 4: "UNKNOWN" VETO WHEN NOTHING LOOKS SIMILAR
     # =========================================================
-    # If High Conf didn't trigger, and Rescue didn't trigger, 
-    # we enforce the strict similarity threshold to catch Zero-Days.
     if rag_summary and rag_summary.sim_max < RAG_VETO_THRESH:
-        if debug: print(f"   -> Triggered PHASE 4: RAG Veto (Sim {rag_summary.sim_max:.4f} too low)")
+        if debug:
+            print(f"   -> Triggered PHASE 4: RAG Veto (Sim {rag_summary.sim_max:.4f} too low)")
         return "UNKNOWN_MALICIOUS", [
             f"RAG VETO: Similarity {rag_summary.sim_max:.4f} < {RAG_VETO_THRESH}.",
-            "Flow is unique/unknown."
+            "Flow is unique/unknown.",
         ], "Unknown"
 
     # =========================================================
     # PHASE 5: STANDARD FALLBACK
     # =========================================================
-    if debug: print("   -> Triggered PHASE 5: Fallback")
-    
+    if debug:
+        print("   -> Triggered PHASE 5: Fallback")
+
     if rf_out.p_malicious < 0.50:
         return "KNOWN_BENIGN", ["Binary RF indicates Benign."], "Normal"
 
     if family_out.family_unknown:
         return "UNKNOWN_MALICIOUS", ["Family RF is low confidence (Unknown)."], "Unknown"
-    
+
     return "KNOWN_MALICIOUS", ["Family RF is moderately confident."], pred_str
 
 
@@ -1069,17 +1136,16 @@ def compute_open_set_for_row(
     row: pd.Series,
     feature_cols: List[str],
     rag_summary: Optional[RAGSummary] = None,
-    debug: bool = False, # <--- 1. ADD ARGUMENT
+    debug: bool = False,
 ) -> Tuple[str, List[str], RFOutput, FamilyRFOutput, str]:
-    
+
     rf_out = rf_forward(rf, row, feature_cols)
     family_out = family_forward(family_clf, family_le, row, feature_cols)
-    
-    # 2. PASS debug=debug
+
     open_set_label, reasons, derived_family = derive_open_set_label_with_family(
-            rf_out, family_out, rag_summary=rag_summary, debug=debug
-        )
-    
+        rf_out, family_out, rag_summary=rag_summary, debug=debug
+    )
+
     return open_set_label, reasons, rf_out, family_out, derived_family
 
 
@@ -1134,7 +1200,7 @@ def enforce_llm_override_policy(
     p_malicious: float,
     mal_frac: float,
 ) -> Tuple[str, str]:
-    
+
     base_label = open_set_label.strip().upper()
     llm_label = (llm_decision or "").strip().upper()
     llm_action = (llm_action or "").strip().upper()
@@ -1143,22 +1209,35 @@ def enforce_llm_override_policy(
     if llm_label not in valid_labels:
         final_label = base_label
     else:
-        # 1. Block Dangerous Downgrade (Malicious -> Benign)
-        if (llm_label == "KNOWN_BENIGN" and p_malicious > 0.90 and mal_frac > 0.90):
+        # 1. Block Dangerous Downgrade (Malicious -> Benign) when evidence is strong
+        if llm_label == "KNOWN_BENIGN" and p_malicious > 0.90 and mal_frac > 0.90:
             print(f"[POLICY] Blocking LLM downgrade to BENIGN. Keeping {base_label}.")
             final_label = base_label
-            
-        # 2. NEW FIX: Block "Confusion" Downgrade (Known -> Unknown)
-        # If Python says "Known Malicious" and neighbors confirm it (mal_frac=1.0),
-        # do NOT let the LLM say "I don't know".
+
+        # 2. Block downgrade of very high-confidence KNOWN_MALICIOUS
         elif (
-            base_label == "KNOWN_MALICIOUS" 
-            and llm_label == "UNKNOWN_MALICIOUS"
-            and mal_frac > 0.95  # RAG says 100% of neighbors are malicious
+            base_label == "KNOWN_MALICIOUS"
+            and llm_label != "KNOWN_MALICIOUS"
+            and p_malicious > 0.95
         ):
-            print(f"[POLICY] Blocking LLM downgrade to UNKNOWN. Evidence is too strong. Keeping {base_label}.")
+            print(
+                "[POLICY] Blocking LLM downgrade from high-confidence KNOWN_MALICIOUS. "
+                f"Keeping {base_label}."
+            )
             final_label = base_label
-            
+
+        # 3. Block downgrade to UNKNOWN when neighbors are overwhelmingly malicious
+        elif (
+            base_label == "KNOWN_MALICIOUS"
+            and llm_label == "UNKNOWN_MALICIOUS"
+            and mal_frac > 0.95
+        ):
+            print(
+                "[POLICY] Blocking LLM downgrade to UNKNOWN. Evidence is too strong. "
+                f"Keeping {base_label}."
+            )
+            final_label = base_label
+
         else:
             final_label = llm_label
 
@@ -1173,9 +1252,9 @@ def llm_explain_flow(
     family_out: FamilyRFOutput,
     rag: RAGSummary,
     open_set_label: str,
-    derived_family: str,  # <--- 1. ADD THIS ARGUMENT
-) -> Tuple[str, str, str, str]: # <--- 2. UPDATE RETURN TYPE HINT (3 -> 4 items)
-    
+    derived_family: str,
+) -> Tuple[str, str, str, str]:
+
     """
     Ask the LLM for an explanation, then apply the override policy.
     """
@@ -1245,7 +1324,7 @@ Top-k similar historical flows:
 
 [OPEN-SET LABEL (upstream heuristic)]
 Label: {open_set_label}
-Suggested Family: {derived_family}  <--- 3. NOW THIS WORKS
+Suggested Family: {derived_family}
 
 Respect the open-set label as a strong prior: you may disagree only if there is a clear contradiction in the data.
     """.strip()
@@ -1275,7 +1354,6 @@ Respect the open-set label as a strong prior: you may disagree only if there is 
         f"Recommended_action (after policy): {final_action}"
     )
 
-    # Return the derived_family as well so it can be passed to UI/logs if needed
     return llm_text, final_decision, final_action, derived_family
 
 
@@ -1324,11 +1402,14 @@ def select_demo_flows(
 
         # Pass 1: open-set == desired_label AND ground-truth == desired_label
         for _, row in df_sample.iterrows():
-            # FIX: Unpack 5 values here using an underscore for the unused 'derived_family'
             os_label, _, rf_out, _, _ = compute_open_set_for_row(
-                rf, family_clf, family_le, row, feature_cols,
+                rf,
+                family_clf,
+                family_le,
+                row,
+                feature_cols,
                 rag_summary=None,
-                debug=False
+                debug=False,
             )
 
             if os_label != desired_label:
@@ -1349,19 +1430,21 @@ def select_demo_flows(
 
         # Pass 2: only require open-set label match
         for _, row in df_sample.iterrows():
-            # FIX: Unpack 5 values here as well
             os_label, _, _, _, _ = compute_open_set_for_row(
-                rf, family_clf, family_le, row, feature_cols,
+                rf,
+                family_clf,
+                family_le,
+                row,
+                feature_cols,
                 rag_summary=None,
-                debug=False
+                debug=False,
             )
             if os_label == desired_label:
                 return row
 
-        # Pass 3: give up and just return some row
+        # Pass 3: just return some row
         return df_sample.iloc[len(df_sample) // 2]
 
-    # 1) KNOWN_BENIGN: from known test set with label==0
     df_benign_known = df_test_known[df_test_known["label"] == 0]
     benign_row = pick_one(
         df=df_benign_known,
@@ -1371,7 +1454,6 @@ def select_demo_flows(
         seed=1,
     )
 
-    # 2) KNOWN_MALICIOUS: from known test set, label==1, family not in UNKNOWN_FAMILIES
     df_mal_known = df_test_known[
         (df_test_known["label"] == 1)
         & (~df_test_known["attack_cat"].isin(UNKNOWN_FAMILIES))
@@ -1384,7 +1466,6 @@ def select_demo_flows(
         seed=2,
     )
 
-    # 3) UNKNOWN_MALICIOUS: from df_test_unknown (these are held-out families)
     unk_row = None
     if not df_test_unknown.empty:
         unk_row = pick_one(
@@ -1414,18 +1495,9 @@ def main() -> None:
         feature_cols,
     ) = make_open_set_splits(df_train_raw, df_test_raw, UNKNOWN_FAMILIES)
 
-    print("\n=== Sanity check: feature columns used by RF ===")
-    print(feature_cols)
-    print(f"Total features: {len(feature_cols)}\n")
-
     rf = train_binary_rf(df_train_known, df_val_known, feature_cols)
-    rf_open_set_eval(rf, df_test_known, df_test_unknown, feature_cols)
-
     family_clf, family_le, _ = train_family_rf(df_train_known, feature_cols)
 
-    # --- Choose "good" demo flows algorithmically ---
-    # Note: Ensure select_demo_flows internally handles the new signatures if it calls them,
-    # or pass rag_summary=None inside it to keep it fast.
     row_benign, row_mal, row_unknown = select_demo_flows(
         df_test_known=df_test_known,
         df_test_unknown=df_test_unknown,
@@ -1435,341 +1507,64 @@ def main() -> None:
         feature_cols=feature_cols,
     )
 
-    print(
-        "[INFO] Initializing Ollama embedding model 'nomic-embed-text' "
-        "at http://localhost:11434..."
-    )
+    print("[INFO] Initializing Ollama embedding model 'nomic-embed-text'...")
     embedding = OllamaEmbeddings(model="nomic-embed-text", base_url="http://localhost:11434")
-
     vectorstore = build_or_load_chroma(df_train_known, embedding)
 
-    # Note: Ensure evaluate_family_open_set_with_rag is updated if it calls helper functions,
-    # otherwise this part is fine as it uses raw probs.
-    evaluate_family_open_set_with_rag(
-        df_test_known,
-        df_test_unknown,
-        feature_cols,
-        family_clf,
-        family_le,
-    )
-
-    print("[INFO] Initializing ChatOllama model 'llama3.1' at http://localhost:11434")
-    # temperature=0.0 for determinism
+    print("[INFO] Initializing ChatOllama model 'llama3.1'...")
     llm = ChatOllama(model="llama3.1", base_url="http://localhost:11434", temperature=0.0)
 
-    print("=== Running curated LLM demos (3 flows) ===\n")
+    print("\n=== Running curated LLM demos (3 flows) ===\n")
 
-    demo_metrics: List[Dict[str, Any]] = []
-    
-    # ---------------------------------------------------------------------
-    # Demo 1: KNOWN_BENIGN flow
-    # ---------------------------------------------------------------------
-    if row_benign is None:
-        print("[WARN] Could not find a good KNOWN_BENIGN demo row; skipping Demo 1.\n")
-    else:
-        idx_benign = int(row_benign.name)
-        print(f"[DEMO] Demo 1: KNOWN_BENIGN flow (row_idx={idx_benign})")
-        print(
-            f"True attack family: {row_benign['attack_cat']}  "
-            f"(binary label: {row_benign['label']})\n"
-        )
+    demos = [
+        ("Demo 1: KNOWN_BENIGN", row_benign),
+        ("Demo 2: KNOWN_MALICIOUS", row_mal),
+        ("Demo 3: UNKNOWN-family", row_unknown),
+    ]
 
-        # 1. Forward passes
-        rf_benign = rf_forward(rf, row_benign, feature_cols)
-        family_benign = family_forward(family_clf, family_le, row_benign, feature_cols)
-        
-        # 2. RAG Retrieval
-        q_text = serialize_unsw_flow(row_benign, include_labels=True)
-        rag_benign = retrieve_neighbors(vectorstore, q_text, k=5)
-        
-        # 3. Derive Label (With RAG Summary) -> Returns 3 values now
-        label_benign, reasons_benign, derived_family_benign = derive_open_set_label_with_family(
-            rf_benign, 
-            family_benign, 
-            rag_summary=rag_benign,
-            debug=True
+    for title, row in demos:
+        if row is None:
+            print(f"[WARN] Skipping {title} (no row selected).")
+            continue
+            
+        print(f"[{title}] (row_idx={row.name})")
+        print(f"True attack family: {row.get('attack_cat', 'Unknown')} (binary label: {row.get('label')})\n")
+
+        # 1. RUN RF FIRST (We need the prediction to guide the search)
+        rf_out = rf_forward(rf, row, feature_cols)
+        family_out = family_forward(family_clf, family_le, row, feature_cols)
+
+        # 2. RUN RAG (Guided by RF)
+        q_text = serialize_unsw_flow(row, include_labels=False)
+        # PASS rf_out HERE!
+        rag = retrieve_neighbors(vectorstore, q_text, rf_out=rf_out, k=5)
+
+        # 3. LOGIC
+        label, reasons, derived_family = derive_open_set_label_with_family(
+            rf_out, family_out, rag_summary=rag, debug=True
         )
 
         print("[INFO] RF + RAG + Family signals before LLM:")
-        print(f"  p_benign        = {rf_benign.p_benign:9.6f}")
-        print(f"  p_malicious     = {rf_benign.p_malicious:9.6f}")
-        print(f"  RF_confidence   = {rf_benign.rf_confidence:9.6f}")
-        print(f"  sim_max         = {rag_benign.sim_max:.6f}")
-        print(f"  sim_mean        = {rag_benign.sim_mean:.6f}")
-        print(f"  mal_frac        = {rag_benign.mal_frac:.3f}")
-        print(f"  family_diversity= {rag_benign.family_diversity}")
-        print(f"  family_pred     = {family_benign.family_pred}")
-        print(f"  family_conf     = {family_benign.family_conf:9.6f}")
-        print(f"  family_unknown  = {family_benign.family_unknown}")
-        print(f"  open-set label  = {label_benign}")
-        print(f"  derived family  = {derived_family_benign}")
-        for r in reasons_benign:
-            print(f"    - reason: {r}")
-        print()
-
-        print("[INFO] Serialized current flow (no dataset labels):")
-        print(serialize_unsw_flow(row_benign, include_labels=False), "\n")
-
-        if rag_benign.neighbors:
-            print("[INFO] Retrieved similar flows (titles only):")
-            for n in rag_benign.neighbors:
-                label_txt = "malicious" if n.label == 1 else "benign"
-                row_part = f", row_idx={n.row_idx}" if n.row_idx is not None else ""
-                print(
-                    f"Neighbor: family={n.family}, label={label_txt}, "
-                    f"similarity={n.score:.6f}{row_part}"
-                )
-            print()
+        print(f"  p_malicious     = {rf_out.p_malicious:.6f}")
+        print(f"  RF_confidence   = {rf_out.rf_confidence:.6f}")
+        print(f"  sim_max         = {rag.sim_max:.6f}")
+        print(f"  family_pred     = {family_out.family_pred}")
+        print(f"  open-set label  = {label}")
+        
+        print("\n[INFO] Neighbors:")
+        if rag.neighbors:
+            for n in rag.neighbors:
+                print(f"  - Family: {n.family}, Label: {n.label}, Score: {n.score:.4f}")
         else:
-            print("[INFO] No similar flows retrieved.\n")
+            print("  (No neighbors found matching filter)")
 
-        # 4. LLM Explanation (Pass derived_family)
-        llm_text_benign, final_decision_benign, final_action_benign, _ = llm_explain_flow(
-            llm, 
-            row_benign, 
-            rf_benign, 
-            family_benign, 
-            rag_benign, 
-            label_benign,
-            derived_family_benign
-        )
-        print(llm_text_benign, "\n")
-
-        gt_label_benign = ground_truth_open_set_label(row_benign)
-        correct_open_set = (label_benign == gt_label_benign)
-        correct_final = (final_decision_benign == gt_label_benign)
-        print(
-            f"[ACCURACY] Demo 1: GT={gt_label_benign}, "
-            f"open_set={label_benign} ({'OK' if correct_open_set else 'WRONG'}), "
-            f"final={final_decision_benign} ({'OK' if correct_final else 'WRONG'})\n"
-        )
-
-        demo_metrics.append(
-            {
-                "name": "Demo 1 (KNOWN_BENIGN)",
-                "gt": gt_label_benign,
-                "open_set": label_benign,
-                "final": final_decision_benign,
-                "family": str(row_benign["attack_cat"]),
-                "correct_open_set": correct_open_set,
-                "correct_final": correct_final,
-            }
-        )
-
-    # ---------------------------------------------------------------------
-    # Demo 2: KNOWN_MALICIOUS flow (known families)
-    # ---------------------------------------------------------------------
-    if row_mal is None:
-        print("[WARN] Could not find a good KNOWN_MALICIOUS demo row; skipping Demo 2.\n")
-    else:
-        idx_mal = int(row_mal.name)
-        print(f"[DEMO] Demo 2: KNOWN_MALICIOUS flow (known-family test row_idx={idx_mal})")
-        print(
-            f"True attack family: {row_mal['attack_cat']}  "
-            f"(binary label: {row_mal['label']})\n"
-        )
-
-        # 1. Forward passes
-        rf_mal = rf_forward(rf, row_mal, feature_cols)
-        family_mal = family_forward(family_clf, family_le, row_mal, feature_cols)
-        
-        # 2. RAG Retrieval
-        q_text = serialize_unsw_flow(row_mal, include_labels=True)
-        rag_mal = retrieve_neighbors(vectorstore, q_text, k=5)
-        
-        # 3. Derive Label (With RAG Summary)
-        label_mal, reasons_mal, derived_family_mal = derive_open_set_label_with_family(
-            rf_mal, 
-            family_mal, 
-            rag_summary=rag_mal,
-            debug=True
-        )
-
-        print("[INFO] RF + RAG + Family signals before LLM:")
-        print(f"  p_benign        = {rf_mal.p_benign:9.6f}")
-        print(f"  p_malicious     = {rf_mal.p_malicious:9.6f}")
-        print(f"  RF_confidence   = {rf_mal.rf_confidence:9.6f}")
-        print(f"  sim_max         = {rag_mal.sim_max:.6f}")
-        print(f"  sim_mean        = {rag_mal.sim_mean:.6f}")
-        print(f"  mal_frac        = {rag_mal.mal_frac:.3f}")
-        print(f"  family_diversity= {rag_mal.family_diversity}")
-        print(f"  family_pred     = {family_mal.family_pred}")
-        print(f"  family_conf     = {family_mal.family_conf:9.6f}")
-        print(f"  family_unknown  = {family_mal.family_unknown}")
-        print(f"  open-set label  = {label_mal}")
-        print(f"  derived family  = {derived_family_mal}")
-        for r in reasons_mal:
-            print(f"    - reason: {r}")
-        print()
-
-        print("[INFO] Serialized current flow (no dataset labels):")
-        print(serialize_unsw_flow(row_mal, include_labels=False), "\n")
-
-        if rag_mal.neighbors:
-            print("[INFO] Retrieved similar flows (titles only):")
-            for n in rag_mal.neighbors:
-                label_txt = "malicious" if n.label == 1 else "benign"
-                row_part = f", row_idx={n.row_idx}" if n.row_idx is not None else ""
-                print(
-                    f"Neighbor: family={n.family}, label={label_txt}, "
-                    f"similarity={n.score:.6f}{row_part}"
-                )
-            print()
-        else:
-            print("[INFO] No similar flows retrieved.\n")
-
-        # 4. LLM Explanation (Pass derived_family)
-        llm_text_mal, final_decision_mal, final_action_mal, _ = llm_explain_flow(
-            llm, 
-            row_mal, 
-            rf_mal, 
-            family_mal, 
-            rag_mal, 
-            label_mal,
-            derived_family_mal
-        )
-        print(llm_text_mal, "\n")
-
-        gt_label_mal = ground_truth_open_set_label(row_mal)
-        correct_open_set = (label_mal == gt_label_mal)
-        correct_final = (final_decision_mal == gt_label_mal)
-        print(
-            f"[ACCURACY] Demo 2: GT={gt_label_mal}, "
-            f"open_set={label_mal} ({'OK' if correct_open_set else 'WRONG'}), "
-            f"final={final_decision_mal} ({'OK' if correct_final else 'WRONG'})\n"
-        )
-
-        demo_metrics.append(
-            {
-                "name": "Demo 2 (KNOWN_MALICIOUS)",
-                "gt": gt_label_mal,
-                "open_set": label_mal,
-                "final": final_decision_mal,
-                "family": str(row_mal["attack_cat"]),
-                "correct_open_set": correct_open_set,
-                "correct_final": correct_final,
-            }
-        )
-
-    # ---------------------------------------------------------------------
-    # Demo 3: UNKNOWN-family flow (held-out → UNKNOWN_MALICIOUS)
-    # ---------------------------------------------------------------------
-    if row_unknown is None:
-        print("[WARN] No suitable unknown-family flow found; skipping Demo 3.\n")
-    else:
-        idx_unk = int(row_unknown.name)
-        print(f"[DEMO] Demo 3: UNKNOWN-family flow (open-set, row_idx={idx_unk})")
-        print(
-            f"True attack family: {row_unknown['attack_cat']}  "
-            f"(binary label: {row_unknown['label']})\n"
-        )
-
-        # 1. Forward passes
-        rf_unknown = rf_forward(rf, row_unknown, feature_cols)
-        family_unknown_out = family_forward(
-            family_clf, family_le, row_unknown, feature_cols
+        # 4. LLM
+        llm_text, final_decision, final_action, _ = llm_explain_flow(
+            llm, row, rf_out, family_out, rag, label, derived_family
         )
         
-        # 2. RAG Retrieval
-        q_text = serialize_unsw_flow(row_unknown, include_labels=True)
-        rag_unknown = retrieve_neighbors(vectorstore, q_text, k=5)
-        
-        # 3. Derive Label (With RAG Summary)
-        label_unknown, reasons_unknown, derived_family_unknown = derive_open_set_label_with_family(
-            rf_unknown, 
-            family_unknown_out, 
-            rag_summary=rag_unknown,
-            debug=True
-        )
-
-        print("[INFO] RF + RAG + Family signals before LLM:")
-        print(f"  p_benign        = {rf_unknown.p_benign:9.6f}")
-        print(f"  p_malicious     = {rf_unknown.p_malicious:9.6f}")
-        print(f"  RF_confidence   = {rf_unknown.rf_confidence:9.6f}")
-        print(f"  sim_max         = {rag_unknown.sim_max:.6f}")
-        print(f"  sim_mean        = {rag_unknown.sim_mean:.6f}")
-        print(f"  mal_frac        = {rag_unknown.mal_frac:.3f}")
-        print(f"  family_diversity= {rag_unknown.family_diversity}")
-        print(f"  family_pred     = {family_unknown_out.family_pred}")
-        print(f"  family_conf     = {family_unknown_out.family_conf:9.6f}")
-        print(f"  family_unknown  = {family_unknown_out.family_unknown}")
-        print(f"  open-set label  = {label_unknown}")
-        print(f"  derived family  = {derived_family_unknown}")
-        for r in reasons_unknown:
-            print(f"    - reason: {r}")
-        print()
-
-        print("[INFO] Serialized current flow (no dataset labels):")
-        print(serialize_unsw_flow(row_unknown, include_labels=False), "\n")
-
-        if rag_unknown.neighbors:
-            print("[INFO] Retrieved similar flows (titles only):")
-            for n in rag_unknown.neighbors:
-                label_txt = "malicious" if n.label == 1 else "benign"
-                row_part = f", row_idx={n.row_idx}" if n.row_idx is not None else ""
-                print(
-                    f"Neighbor: family={n.family}, label={label_txt}, "
-                    f"similarity={n.score:.6f}{row_part}"
-                )
-            print()
-        else:
-            print("[INFO] No similar flows retrieved.\n")
-
-        # 4. LLM Explanation (Pass derived_family)
-        llm_text_unknown, final_decision_unknown, final_action_unknown, _ = llm_explain_flow(
-            llm,
-            row_unknown,
-            rf_unknown,
-            family_unknown_out,
-            rag_unknown,
-            label_unknown,
-            derived_family_unknown
-        )
-        print(llm_text_unknown, "\n")
-
-        gt_label_unknown = ground_truth_open_set_label(row_unknown)
-        correct_open_set = (label_unknown == gt_label_unknown)
-        correct_final = (final_decision_unknown == gt_label_unknown)
-        print(
-            f"[ACCURACY] Demo 3: GT={gt_label_unknown}, "
-            f"open_set={label_unknown} ({'OK' if correct_open_set else 'WRONG'}), "
-            f"final={final_decision_unknown} ({'OK' if correct_final else 'WRONG'})\n"
-        )
-
-        demo_metrics.append(
-            {
-                "name": "Demo 3 (UNKNOWN_MALICIOUS)",
-                "gt": gt_label_unknown,
-                "open_set": label_unknown,
-                "final": final_decision_unknown,
-                # For UNKNOWN_MALICIOUS, treat family as NA in summary
-                "family": "NA",
-                "correct_open_set": correct_open_set,
-                "correct_final": correct_final,
-            }
-        )
-
-    # -----------------------------
-    # Summary of demo accuracy
-    # -----------------------------
-    if demo_metrics:
-        total = len(demo_metrics)
-        acc_open = sum(m["correct_open_set"] for m in demo_metrics) / total
-        acc_final = sum(m["correct_final"] for m in demo_metrics) / total
-
-        print("=== Demo accuracy summary (3 curated flows) ===")
-        for m in demo_metrics:
-            family_str = m.get("family", "NA")
-            print(
-                f"{m['name']}: "
-                f"GT={m['gt']} (family={family_str}), "
-                f"open_set={m['open_set']} ({'OK' if m['correct_open_set'] else 'WRONG'}), "
-                f"final={m['final']} ({'OK' if m['correct_final'] else 'WRONG'})"
-            )
-        print(f"\nOverall open-set heuristic accuracy on demos: {acc_open:.3f}")
-        print(f"Overall final (LLM+policy) accuracy on demos: {acc_final:.3f}\n")
-    else:
-        print("[WARN] No demos were run; no demo accuracy to report.\n")
+        print("\n[LLM Decision]:", final_decision)
+        print("-" * 60 + "\n")
 
 if __name__ == "__main__":
     main()
