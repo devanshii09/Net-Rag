@@ -22,6 +22,7 @@ from unsw_open_set_rag_demo import (
     compute_open_set_for_row,
     ground_truth_open_set_label,
     llm_explain_flow,
+    derive_open_set_label_with_family,
 )
 
 st.set_page_config(
@@ -99,29 +100,32 @@ def analyze_single_flow(row: pd.Series, df_name: str, pipeline: dict):
     feature_cols = pipeline["feature_cols"]
     vectorstore = pipeline["vectorstore"]
 
-    # 1. Run RAG Retrieval FIRST (Crucial for the logic order)
-    q_text = serialize_unsw_flow(row, include_labels=True)
-    rag = retrieve_neighbors(vectorstore, q_text, k=5)
+    # 1. Run RF Models FIRST (Needed for Guided Retrieval)
+    rf_out = rf_forward(rf, row, feature_cols)
+    family_out = family_forward(family_clf, family_le, row, feature_cols)
 
-    # 2. Compute Open Set Label (Unpacking 5 values now)
-    open_set_label, reasons, rf_out, family_out, derived_family = compute_open_set_for_row(
-        rf,
-        family_clf,
-        family_le,
-        row,
-        feature_cols,
-        rag_summary=rag, # Pass RAG here
+    # 2. Run RAG Retrieval (Now using RF prediction to filter)
+    # Important: use include_labels=False to avoid cheating
+    q_text = serialize_unsw_flow(row, include_labels=False)
+    
+    # PASS rf_out HERE
+    rag = retrieve_neighbors(vectorstore, q_text, rf_out=rf_out, family_out=family_out, k=5)
+
+    # 3. Compute Open Set Label
+    open_set_label, reasons, derived_family = derive_open_set_label_with_family(
+        rf_out,
+        family_out,
+        rag_summary=rag,
+        debug=True, # Optional: prints debug info to terminal
     )
 
-    # 3. LLM: explanation + decision + action
-    # Note: We re-initialize ChatOllama here to ensure fresh state, or use a cached one
+    # 4. LLM: explanation + decision + action
     llm = ChatOllama(
         model="llama3.1",
         base_url="http://localhost:11434",
         temperature=0.0,
     )
 
-    # Pass derived_family to the LLM function
     llm_text, final_decision, final_action, _ = llm_explain_flow(
         llm,
         row,
@@ -129,7 +133,7 @@ def analyze_single_flow(row: pd.Series, df_name: str, pipeline: dict):
         family_out,
         rag,
         open_set_label,
-        derived_family, # <--- Added argument
+        derived_family, 
     )
 
     # Ground-truth open-set label
@@ -145,7 +149,7 @@ def analyze_single_flow(row: pd.Series, df_name: str, pipeline: dict):
         "family_out": family_out,
         "rag": rag,
         "open_set_label": open_set_label,
-        "derived_family": derived_family, # <--- Save this for the UI
+        "derived_family": derived_family,
         "open_set_reasons": reasons,
         "llm_text": llm_text,
         "final_decision": final_decision,
@@ -203,6 +207,7 @@ def sample_row_for_random(
             return row, df_name
 
         gt_label = ground_truth_open_set_label(row)
+        # For sampling we don't need RAG, just the RF+family heuristic
         model_label, _, _, _ = compute_open_set_for_row(
             rf,
             family_clf,
@@ -247,7 +252,8 @@ def render_neighbor_table(rag_summary):
             }
         )
     df_neighbors = pd.DataFrame(rows)
-    st.dataframe(df_neighbors, use_container_width=True)
+    # Streamlit 1.40+ deprecation: use width instead of use_container_width
+    st.dataframe(df_neighbors, width="stretch")
 
 
 def render_flow_summary(result: dict):
@@ -291,23 +297,21 @@ def render_model_outputs(result: dict):
     st.subheader("Family RF output (malicious-only)")
     col4, col5, col6 = st.columns(3)
 
-    # --- CHANGED HERE: Always show the actual prediction ---
+    # Always show the actual prediction
     display_family_pred = str(family_out.family_pred)
-    
+
     with col4:
         st.metric("family_pred", display_family_pred)
     with col5:
         st.metric("family_conf", f"{family_out.family_conf:.6f}")
     with col6:
-        # If unknown, we can display this in red or just normally
         st.metric("family_unknown", str(family_out.family_unknown))
 
-    # Add a small caption if unknown, rather than hiding the label
     if family_out.family_unknown:
         st.caption("⚠️ Family RF confidence is below threshold. This prediction may be inaccurate.")
 
     st.subheader("Open-set label (heuristic, model)")
-    
+
     c1, c2 = st.columns(2)
     with c1:
         st.metric("Model open-set label", open_set_label)
@@ -390,7 +394,7 @@ def main():
             ["KNOWN_BENIGN", "KNOWN_MALICIOUS", "UNKNOWN_MALICIOUS"],
         )
 
-        error_only = False
+        error_only = False  # set True if you want to hunt errors only
 
         if st.sidebar.button("Sample and analyze"):
             row, df_name = sample_row_for_random(
